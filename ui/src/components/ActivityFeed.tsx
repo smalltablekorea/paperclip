@@ -7,8 +7,9 @@ import { issuesApi } from "../api/issues";
 import { queryKeys } from "../lib/queryKeys";
 import { useCompany } from "../context/CompanyContext";
 import { ActivityRow } from "./ActivityRow";
-import { ArtifactFeedCard } from "./ArtifactFeedCard";
+import { FeedCard } from "./FeedCard";
 import { cn } from "../lib/utils";
+import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -16,16 +17,89 @@ import {
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
+  DropdownMenuSeparator,
+  DropdownMenuCheckboxItem,
 } from "@/components/ui/dropdown-menu";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ListFilter, Layers } from "lucide-react";
+import { ListFilter, Layers, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { Identity } from "./Identity";
+import { timeAgo } from "../lib/timeAgo";
 
 /* ------------------------------------------------------------------ */
-/*  Types                                                              */
+/*  Event Tier Classification                                          */
+/* ------------------------------------------------------------------ */
+
+type EventTier = 1 | 2 | 3;
+
+/** Tier 1 = cards (high weight), Tier 2 = one-liners, Tier 3 = hidden by default */
+const ACTION_TIER: Record<string, EventTier> = {
+  // Tier 1 — Cards
+  "issue.created": 1,
+  "issue.document_created": 1,
+  "approval.created": 1,
+  "approval.approved": 1,
+  "approval.rejected": 1,
+  "agent.created": 1,
+
+  // Tier 2 — One-liners
+  "issue.updated": 2,
+  "issue.checked_out": 2,
+  "issue.comment_added": 2,
+  "issue.commented": 2,
+  "heartbeat.invoked": 2,
+  "heartbeat.cancelled": 2,
+  "agent.paused": 2,
+  "agent.resumed": 2,
+  "agent.updated": 2,
+
+  // Tier 3 — Hidden
+  "issue.read_marked": 3,
+  "issue.read_unmarked": 3,
+  "issue.inbox_archived": 3,
+  "issue.inbox_unarchived": 3,
+  "issue.released": 3,
+  "issue.attachment_added": 3,
+  "issue.attachment_removed": 3,
+  "issue.document_deleted": 3,
+  "issue.document_updated": 2,
+  "issue.deleted": 3,
+  "issue.feedback_vote_saved": 3,
+  "agent.key_created": 3,
+  "agent.budget_updated": 3,
+  "agent.runtime_session_reset": 3,
+  "agent.skills_synced": 3,
+  "agent.terminated": 2,
+  "company.created": 3,
+  "company.updated": 3,
+  "company.archived": 3,
+  "company.budget_updated": 3,
+  "company.skill_created": 3,
+  "company.skill_deleted": 3,
+  "project.created": 2,
+  "project.updated": 3,
+  "project.deleted": 3,
+  "goal.created": 2,
+  "goal.updated": 3,
+  "goal.deleted": 3,
+  "cost.reported": 3,
+  "cost.recorded": 3,
+};
+
+function getEventTier(event: ActivityEvent): EventTier {
+  // Special case: issue.updated with status → in_review is tier 1
+  if (event.action === "issue.updated" && event.details) {
+    const details = event.details as Record<string, unknown>;
+    if (details.status === "in_review") return 1;
+  }
+  return ACTION_TIER[event.action] ?? 3;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Filter & Group Types                                               */
 /* ------------------------------------------------------------------ */
 
 type FilterValue = "all" | "in-progress" | "for-review" | "completed";
@@ -38,25 +112,13 @@ const FILTER_OPTIONS: Array<{ value: FilterValue; label: string }> = [
   { value: "completed", label: "Done" },
 ];
 
-/** Activity actions that correspond to each filter bucket */
 const FILTER_ACTIONS: Record<FilterValue, Set<string> | null> = {
   all: null,
-  "in-progress": new Set([
-    "issue.created",
-    "issue.checked_out",
-    "heartbeat.invoked",
-  ]),
-  "for-review": new Set([
-    "approval.created",
-    "issue.document_created",
-    "issue.document_updated",
-  ]),
-  completed: new Set([
-    "approval.approved",
-  ]),
+  "in-progress": new Set(["issue.created", "issue.checked_out", "heartbeat.invoked"]),
+  "for-review": new Set(["approval.created", "issue.document_created", "issue.document_updated"]),
+  completed: new Set(["approval.approved"]),
 };
 
-/** Actions that also match via issue.updated status details */
 const STATUS_FILTER_MAP: Record<FilterValue, Set<string> | null> = {
   all: null,
   "in-progress": new Set(["in_progress"]),
@@ -64,58 +126,197 @@ const STATUS_FILTER_MAP: Record<FilterValue, Set<string> | null> = {
   completed: new Set(["done"]),
 };
 
-/** Events that should render as richer artifact cards */
-const ARTIFACT_ACTIONS = new Set([
-  "issue.document_created",
-  "issue.document_updated",
-  "approval.created",
-]);
+function matchesFilter(event: ActivityEvent, filter: FilterValue): boolean {
+  if (filter === "all") return true;
+  const actions = FILTER_ACTIONS[filter];
+  if (actions?.has(event.action)) return true;
+  if (event.action === "issue.updated" && event.details) {
+    const statusSet = STATUS_FILTER_MAP[filter];
+    const details = event.details as Record<string, unknown>;
+    if (statusSet && typeof details.status === "string" && statusSet.has(details.status)) return true;
+  }
+  return false;
+}
 
-/** How many events to show initially (session-weighted) */
+/* ------------------------------------------------------------------ */
+/*  Collapse Sequential Events                                         */
+/* ------------------------------------------------------------------ */
+
+interface CollapsedGroup {
+  type: "collapsed";
+  events: ActivityEvent[];
+  entityId: string;
+  entityType: string;
+  latestEvent: ActivityEvent;
+}
+
+type FeedItem = ActivityEvent | CollapsedGroup;
+
+const COLLAPSE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+function collapseSequential(events: ActivityEvent[]): FeedItem[] {
+  if (events.length === 0) return [];
+
+  const result: FeedItem[] = [];
+  let currentGroup: ActivityEvent[] = [events[0]];
+  let currentKey = `${events[0].entityType}:${events[0].entityId}`;
+
+  for (let i = 1; i < events.length; i++) {
+    const evt = events[i];
+    const key = `${evt.entityType}:${evt.entityId}`;
+    const prevTime = new Date(currentGroup[currentGroup.length - 1].createdAt).getTime();
+    const thisTime = new Date(evt.createdAt).getTime();
+    const withinWindow = Math.abs(prevTime - thisTime) <= COLLAPSE_WINDOW_MS;
+
+    // Only collapse tier-2 events, never collapse tier-1 cards
+    const tier = getEventTier(evt);
+
+    if (key === currentKey && withinWindow && tier >= 2) {
+      currentGroup.push(evt);
+    } else {
+      flushGroup(currentGroup, result);
+      currentGroup = [evt];
+      currentKey = key;
+    }
+  }
+  flushGroup(currentGroup, result);
+  return result;
+}
+
+function flushGroup(group: ActivityEvent[], result: FeedItem[]) {
+  if (group.length <= 2) {
+    // Don't collapse 1-2 items
+    for (const evt of group) result.push(evt);
+  } else {
+    result.push({
+      type: "collapsed",
+      events: group,
+      entityId: group[0].entityId,
+      entityType: group[0].entityType,
+      latestEvent: group[0],
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Recency Helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+const FIVE_MINUTES = 5 * 60 * 1000;
+const ONE_HOUR = 60 * 60 * 1000;
+
+function recencyClass(createdAt: Date | string): string {
+  const age = Date.now() - new Date(createdAt).getTime();
+  if (age < FIVE_MINUTES) return ""; // full opacity, slightly bolder handled via font
+  if (age < ONE_HOUR) return "";
+  return "opacity-60";
+}
+
+function isRecent(createdAt: Date | string): boolean {
+  return Date.now() - new Date(createdAt).getTime() < FIVE_MINUTES;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Animation keyframes (injected once via style tag)                   */
+/* ------------------------------------------------------------------ */
+
+const FEED_ANIMATION_CSS = `
+@keyframes feed-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.feed-item-new {
+  animation: feed-slide-in 300ms ease-out;
+}
+`;
+
 const INITIAL_VISIBLE = 50;
 const LOAD_MORE_COUNT = 30;
 
 /* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
+/*  Collapsed Group Component                                          */
 /* ------------------------------------------------------------------ */
 
-function matchesFilter(event: ActivityEvent, filter: FilterValue): boolean {
-  if (filter === "all") return true;
+function CollapsedFeedGroup({
+  group,
+  agentMap,
+  entityNameMap,
+}: {
+  group: CollapsedGroup;
+  agentMap: Map<string, Agent>;
+  entityNameMap: Map<string, string>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const actor = group.latestEvent.actorType === "agent"
+    ? agentMap.get(group.latestEvent.actorId)
+    : null;
+  const actorName = actor?.name
+    ?? (group.latestEvent.actorType === "system" ? "System"
+      : group.latestEvent.actorType === "user" ? "Board"
+      : "Unknown");
+  const entityName = entityNameMap.get(`${group.entityType}:${group.entityId}`);
 
-  const actions = FILTER_ACTIONS[filter];
-  if (actions?.has(event.action)) return true;
+  const link = group.entityType === "issue"
+    ? `/issues/${entityName ?? group.entityId}`
+    : null;
 
-  // Check status changes in issue.updated events
-  if (event.action === "issue.updated" && event.details) {
-    const statusSet = STATUS_FILTER_MAP[filter];
-    const details = event.details as Record<string, unknown>;
-    if (statusSet && typeof details.status === "string" && statusSet.has(details.status)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function groupByIssue(events: ActivityEvent[]): Map<string, ActivityEvent[]> {
-  const groups = new Map<string, ActivityEvent[]>();
-  for (const evt of events) {
-    if (evt.entityType === "issue") {
-      const existing = groups.get(evt.entityId) ?? [];
-      existing.push(evt);
-      groups.set(evt.entityId, existing);
-    } else {
-      // Non-issue events go into an "other" bucket
-      const existing = groups.get("__other__") ?? [];
-      existing.push(evt);
-      groups.set("__other__", existing);
-    }
-  }
-  return groups;
+  return (
+    <div className={cn("text-sm", recencyClass(group.latestEvent.createdAt))}>
+      <button
+        type="button"
+        onClick={() => setExpanded((e) => !e)}
+        className="flex w-full items-center gap-2 px-4 py-2 text-left hover:bg-accent/50 transition-colors"
+      >
+        {expanded
+          ? <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
+          : <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
+        }
+        <span className="flex-1 min-w-0 truncate">
+          <Identity name={actorName} size="xs" className="align-baseline" />
+          <span className="text-muted-foreground ml-1">
+            {group.events.length} updates to{" "}
+          </span>
+          {link ? (
+            <Link
+              to={link}
+              className="font-medium text-foreground hover:underline"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {entityName ?? group.entityId}
+            </Link>
+          ) : (
+            <span className="font-medium">{entityName ?? group.entityId}</span>
+          )}
+        </span>
+        <span className="text-xs text-muted-foreground shrink-0">
+          {timeAgo(group.latestEvent.createdAt)}
+        </span>
+      </button>
+      {expanded && (
+        <div className="ml-5 border-l border-border/50">
+          {group.events.map((evt) => (
+            <ActivityRow
+              key={evt.id}
+              event={evt}
+              agentMap={agentMap}
+              entityNameMap={entityNameMap}
+              className="text-xs py-1.5 pl-3"
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /* ------------------------------------------------------------------ */
-/*  Component                                                          */
+/*  Main Component                                                     */
 /* ------------------------------------------------------------------ */
 
 interface ActivityFeedProps {
@@ -126,8 +327,21 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
   const { selectedCompanyId } = useCompany();
   const [filter, setFilter] = useState<FilterValue>("all");
   const [groupMode, setGroupMode] = useState<GroupMode>("flat");
+  const [showAllActivity, setShowAllActivity] = useState(false);
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  const initialLoadRef = useRef(true);
+
+  // Inject animation CSS once
+  useEffect(() => {
+    const id = "feed-animation-styles";
+    if (document.getElementById(id)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = FEED_ANIMATION_CSS;
+    document.head.appendChild(style);
+  }, []);
 
   // Fetch company-level activity, poll every 5s
   const { data: activity } = useQuery({
@@ -137,7 +351,7 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
     refetchInterval: 5000,
   });
 
-  // Fetch agents for name resolution
+  // Fetch agents for name resolution + empty state
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
     queryFn: () => agentsApi.list(selectedCompanyId!),
@@ -160,30 +374,48 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
   const entityNameMap = useMemo(() => {
     const map = new Map<string, string>();
     for (const a of agents ?? []) map.set(`agent:${a.id}`, a.name);
-    for (const i of issues ?? []) {
-      map.set(`issue:${i.id}`, i.identifier ?? i.id);
-    }
+    for (const i of issues ?? []) map.set(`issue:${i.id}`, i.identifier ?? i.id);
     return map;
   }, [agents, issues]);
 
   const entityTitleMap = useMemo(() => {
     const map = new Map<string, string>();
-    for (const i of issues ?? []) {
-      map.set(`issue:${i.id}`, i.title);
-    }
+    for (const i of issues ?? []) map.set(`issue:${i.id}`, i.title);
     return map;
   }, [issues]);
 
-  // Filter and sort events (newest first for the feed)
-  const filteredEvents = useMemo(() => {
+  // Filter, tier, sort events
+  const processedItems = useMemo(() => {
     const events = (activity ?? [])
-      .filter((evt) => matchesFilter(evt, filter))
+      .filter((evt) => {
+        const tier = getEventTier(evt);
+        if (!showAllActivity && tier === 3) return false;
+        return matchesFilter(evt, filter);
+      })
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return events;
-  }, [activity, filter]);
 
-  const visibleEvents = filteredEvents.slice(0, visibleCount);
-  const hasMore = filteredEvents.length > visibleCount;
+    return collapseSequential(events);
+  }, [activity, filter, showAllActivity]);
+
+  const visibleItems = processedItems.slice(0, visibleCount);
+  const hasMore = processedItems.length > visibleCount;
+
+  // Track seen IDs for entrance animation
+  useEffect(() => {
+    if (!activity) return;
+    if (initialLoadRef.current) {
+      // On first load, mark all as seen (no animation for initial batch)
+      for (const evt of activity) seenIdsRef.current.add(evt.id);
+      initialLoadRef.current = false;
+    }
+  }, [activity]);
+
+  const isNewItem = useCallback((id: string) => {
+    if (initialLoadRef.current) return false;
+    if (seenIdsRef.current.has(id)) return false;
+    seenIdsRef.current.add(id);
+    return true;
+  }, []);
 
   // Reset visible count when filter changes
   useEffect(() => {
@@ -194,40 +426,127 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el || !hasMore) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
-    if (nearBottom) {
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
       setVisibleCount((prev) => prev + LOAD_MORE_COUNT);
     }
   }, [hasMore]);
 
-  const isArtifactEvent = (evt: ActivityEvent) => ARTIFACT_ACTIONS.has(evt.action);
+  // Check for active heartbeat runs (recent invoked without cancelled)
+  const activeHeartbeatEntityIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const evt of activity ?? []) {
+      if (evt.action === "heartbeat.invoked" && isRecent(evt.createdAt)) {
+        ids.add(evt.entityId);
+      }
+    }
+    // Remove any that have been cancelled
+    for (const evt of activity ?? []) {
+      if (evt.action === "heartbeat.cancelled") {
+        ids.delete(evt.entityId);
+      }
+    }
+    return ids;
+  }, [activity]);
 
-  const renderEvent = (evt: ActivityEvent) => {
-    if (isArtifactEvent(evt)) {
+  /* ---------------------------------------------------------------- */
+  /*  Render helpers                                                   */
+  /* ---------------------------------------------------------------- */
+
+  const renderItem = (item: FeedItem, index: number, items: FeedItem[]) => {
+    // Insert recency separator
+    let separator: React.ReactNode = null;
+    if (index > 0) {
+      const prevCreatedAt = "type" in item
+        ? item.latestEvent.createdAt
+        : item.createdAt;
+      const prevItem = items[index - 1];
+      const prevPrevCreatedAt = "type" in prevItem
+        ? prevItem.latestEvent.createdAt
+        : prevItem.createdAt;
+
+      const prevIsRecent = isRecent(prevPrevCreatedAt);
+      const thisIsRecent = isRecent(prevCreatedAt);
+      if (prevIsRecent && !thisIsRecent) {
+        separator = (
+          <div className="flex items-center gap-2 px-4 py-1.5" key={`sep-${index}`}>
+            <div className="h-px flex-1 bg-border" />
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+              Earlier
+            </span>
+            <div className="h-px flex-1 bg-border" />
+          </div>
+        );
+      }
+    }
+
+    if ("type" in item && item.type === "collapsed") {
+      const animClass = isNewItem(item.latestEvent.id) ? "feed-item-new" : "";
       return (
-        <ArtifactFeedCard
-          key={evt.id}
-          event={evt}
-          agentMap={agentMap}
-          entityNameMap={entityNameMap}
-        />
+        <div key={`group-${item.latestEvent.id}`}>
+          {separator}
+          <div className={animClass}>
+            <CollapsedFeedGroup
+              group={item}
+              agentMap={agentMap}
+              entityNameMap={entityNameMap}
+            />
+          </div>
+        </div>
       );
     }
+
+    const evt = item as ActivityEvent;
+    const tier = getEventTier(evt);
+    const animClass = isNewItem(evt.id) ? "feed-item-new" : "";
+    const fadeClass = recencyClass(evt.createdAt);
+    const isActiveHeartbeat = activeHeartbeatEntityIds.has(evt.entityId) && evt.action === "heartbeat.invoked";
+
+    if (tier === 1) {
+      return (
+        <div key={evt.id}>
+          {separator}
+          <div className={cn(animClass, fadeClass)}>
+            <FeedCard
+              event={evt}
+              agentMap={agentMap}
+              entityNameMap={entityNameMap}
+              entityTitleMap={entityTitleMap}
+              isActive={isActiveHeartbeat}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // Tier 2 (and tier 3 if showAll)
     return (
-      <ActivityRow
-        key={evt.id}
-        event={evt}
-        agentMap={agentMap}
-        entityNameMap={entityNameMap}
-        entityTitleMap={entityTitleMap}
-      />
+      <div key={evt.id}>
+        {separator}
+        <div className={cn(animClass, fadeClass)}>
+          <ActivityRow
+            event={evt}
+            agentMap={agentMap}
+            entityNameMap={entityNameMap}
+            entityTitleMap={entityTitleMap}
+            className="text-xs"
+            isActive={isActiveHeartbeat}
+          />
+        </div>
+      </div>
     );
   };
 
   const renderGrouped = () => {
-    const groups = groupByIssue(visibleEvents);
-    const entries = Array.from(groups.entries());
-    return entries.map(([groupKey, events]) => {
+    // Group by issue entityId
+    const groups = new Map<string, FeedItem[]>();
+    for (const item of visibleItems) {
+      const key = "type" in item ? item.entityId : (item.entityType === "issue" ? item.entityId : "__other__");
+      const existing = groups.get(key) ?? [];
+      existing.push(item);
+      groups.set(key, existing);
+    }
+
+    return Array.from(groups.entries()).map(([groupKey, items]) => {
       const isOther = groupKey === "__other__";
       const issueName = entityNameMap.get(`issue:${groupKey}`);
       const issueTitle = entityTitleMap.get(`issue:${groupKey}`);
@@ -236,19 +555,42 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
         : `${issueName ?? groupKey}${issueTitle ? ` — ${issueTitle}` : ""}`;
 
       return (
-        <div key={groupKey} className="mb-3">
+        <div key={groupKey} className="mb-2">
           <div className="sticky top-0 z-10 bg-background/95 backdrop-blur-sm border-b px-4 py-1.5">
-            <p className="text-xs font-medium text-muted-foreground truncate">
-              {label}
-            </p>
+            <p className="text-xs font-medium text-muted-foreground truncate">{label}</p>
           </div>
-          {events.map(renderEvent)}
+          {items.map((item, i) => renderItem(item, i, items))}
         </div>
       );
     });
   };
 
-  const isEmpty = visibleEvents.length === 0;
+  /* ---------------------------------------------------------------- */
+  /*  Empty state                                                      */
+  /* ---------------------------------------------------------------- */
+
+  const emptyMessage = useMemo(() => {
+    if (!agents) return null;
+    if (agents.length === 0) {
+      return {
+        text: "No agents set up yet. Add an agent to get started.",
+        showPulse: false,
+      };
+    }
+    const allPaused = agents.every((a) => a.status === "paused");
+    if (allPaused) {
+      return {
+        text: "All agents are paused. Resume agents from the sidebar to see activity.",
+        showPulse: false,
+      };
+    }
+    return {
+      text: "Your agents are running — activity will appear here shortly.",
+      showPulse: true,
+    };
+  }, [agents]);
+
+  const isEmpty = visibleItems.length === 0;
 
   return (
     <aside className={cn("flex min-h-0 min-w-0 flex-1 flex-col bg-background", className)}>
@@ -270,9 +612,7 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
                 size="icon-sm"
                 className="shrink-0 text-muted-foreground"
                 aria-label="group by task"
-                onClick={() =>
-                  setGroupMode((m) => (m === "flat" ? "by-task" : "flat"))
-                }
+                onClick={() => setGroupMode((m) => (m === "flat" ? "by-task" : "flat"))}
               >
                 <Layers className="h-3.5 w-3.5" />
               </Button>
@@ -289,7 +629,7 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
                 <DropdownMenuTrigger asChild>
                   <Button
                     type="button"
-                    variant={filter !== "all" ? "secondary" : "ghost"}
+                    variant={filter !== "all" || showAllActivity ? "secondary" : "ghost"}
                     size="icon-sm"
                     className="shrink-0 text-muted-foreground"
                     aria-label="filter by"
@@ -311,6 +651,13 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
                   </DropdownMenuRadioItem>
                 ))}
               </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuCheckboxItem
+                checked={showAllActivity}
+                onCheckedChange={(v) => setShowAllActivity(!!v)}
+              >
+                Show all activity
+              </DropdownMenuCheckboxItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -324,12 +671,20 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
       >
         {isEmpty ? (
           <div className="flex min-h-0 flex-1 items-center justify-center p-6 h-full">
-            <p className="max-w-[14rem] text-center text-sm text-muted-foreground">
-              Activity from your agents will appear here.
-            </p>
+            <div className="flex flex-col items-center gap-2 max-w-[16rem]">
+              {emptyMessage?.showPulse && (
+                <span className="relative flex h-2.5 w-2.5">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/40" />
+                  <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-primary/60" />
+                </span>
+              )}
+              <p className="text-center text-sm text-muted-foreground">
+                {emptyMessage?.text ?? "Activity from your agents will appear here."}
+              </p>
+            </div>
           </div>
         ) : groupMode === "flat" ? (
-          <div className="divide-y">{visibleEvents.map(renderEvent)}</div>
+          <div>{visibleItems.map((item, i) => renderItem(item, i, visibleItems))}</div>
         ) : (
           renderGrouped()
         )}

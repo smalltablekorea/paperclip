@@ -1,8 +1,9 @@
 import { Link } from "@/lib/router";
-import { Identity } from "./Identity";
+import { AgentIcon } from "./AgentIconPicker";
 import { timeAgo } from "../lib/timeAgo";
 import { cn } from "../lib/utils";
 import { deriveProjectUrlKey, type ActivityEvent, type Agent } from "@paperclipai/shared";
+import { Loader2, User, Settings } from "lucide-react";
 
 const ACTION_VERBS: Record<string, string> = {
   "issue.created": "created",
@@ -85,9 +86,10 @@ interface ActivityRowProps {
   entityNameMap: Map<string, string>;
   entityTitleMap?: Map<string, string>;
   className?: string;
+  isActive?: boolean;
 }
 
-export function ActivityRow({ event, agentMap, entityNameMap, entityTitleMap, className }: ActivityRowProps) {
+export function ActivityRow({ event, agentMap, entityNameMap, entityTitleMap, className, isActive }: ActivityRowProps) {
   const verb = formatVerb(event.action, event.details);
 
   const isHeartbeatEvent = event.entityType === "heartbeat_run";
@@ -108,14 +110,22 @@ export function ActivityRow({ event, agentMap, entityNameMap, entityTitleMap, cl
   const actor = event.actorType === "agent" ? agentMap.get(event.actorId) : null;
   const actorName = actor?.name ?? (event.actorType === "system" ? "System" : event.actorType === "user" ? "Board" : event.actorId || "Unknown");
 
+  const actorIcon = event.actorType === "agent"
+    ? <AgentIcon icon={actor?.icon ?? null} className="inline-block h-3.5 w-3.5 text-muted-foreground align-text-bottom" />
+    : event.actorType === "user"
+      ? <User className="inline-block h-3.5 w-3.5 text-muted-foreground align-text-bottom" />
+      : <Settings className="inline-block h-3.5 w-3.5 text-muted-foreground align-text-bottom" />;
+
   const inner = (
-    <div className="flex gap-3">
+    <div className="flex items-center gap-3">
+      {isActive && (
+        <Loader2 className="h-3 w-3 shrink-0 animate-spin text-amber-500" />
+      )}
       <p className="flex-1 min-w-0 truncate">
-        <Identity
-          name={actorName}
-          size="xs"
-          className="align-baseline"
-        />
+        <span className="inline-flex items-baseline gap-1">
+          {actorIcon}
+          <span className="font-medium text-foreground">{actorName}</span>
+        </span>
         <span className="text-muted-foreground ml-1">{verb} </span>
         {name && <span className="font-medium">{name}</span>}
         {entityTitle && <span className="text-muted-foreground ml-1">— {entityTitle}</span>}
