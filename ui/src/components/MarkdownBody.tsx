@@ -38,7 +38,13 @@ function MarkdownIssueLink({
   const { data } = useQuery({
     queryKey: queryKeys.issues.detail(issuePathId),
     queryFn: () => issuesApi.get(issuePathId),
-    staleTime: 60_000,
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    retry: false,
+    // If the issue doesn't exist (404), cache the failure so we don't
+    // keep re-fetching and flooding DevTools with errors.
+    retryOnMount: false,
+    refetchOnWindowFocus: false,
   });
 
   return (

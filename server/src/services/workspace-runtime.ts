@@ -3,6 +3,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "
 import fs from "node:fs/promises";
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
@@ -977,6 +978,18 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+/**
+ * Create a fallback temporary working directory for projectless issues.
+ * When an issue has no associated project workspace, agents still need a
+ * valid working directory to operate in (even if there is no git repo).
+ */
+async function ensureFallbackWorkdir(baseCwd: string | undefined | null): Promise<string> {
+  if (baseCwd && baseCwd.trim().length > 0) return baseCwd;
+  const fallbackDir = path.join(os.tmpdir(), "paperclip", "projectless-workspaces", randomUUID());
+  await fs.mkdir(fallbackDir, { recursive: true });
+  return fallbackDir;
+}
+
 export async function realizeExecutionWorkspace(input: {
   base: ExecutionWorkspaceInput;
   config: Record<string, unknown>;
@@ -987,13 +1000,38 @@ export async function realizeExecutionWorkspace(input: {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
   const strategyType = asString(rawStrategy.type, "project_primary");
   if (strategyType !== "git_worktree") {
+    const effectiveCwd = await ensureFallbackWorkdir(input.base.baseCwd);
+    const warnings: string[] = [];
+    if (effectiveCwd !== input.base.baseCwd) {
+      warnings.push(
+        `No project workspace is configured for this issue. Using temporary workspace "${effectiveCwd}" for this run.`,
+      );
+    }
     return {
       ...input.base,
       strategy: "project_primary",
-      cwd: input.base.baseCwd,
+      cwd: effectiveCwd,
       branchName: null,
       worktreePath: null,
-      warnings: [],
+      warnings,
+      created: false,
+    };
+  }
+
+  // git_worktree strategy requires a valid baseCwd with a git repo.
+  // If baseCwd is missing (projectless issue), fall back to project_primary
+  // with a temporary directory since we cannot create a worktree without a repo.
+  if (!input.base.baseCwd || input.base.baseCwd.trim().length === 0) {
+    const fallbackCwd = await ensureFallbackWorkdir(input.base.baseCwd);
+    return {
+      ...input.base,
+      strategy: "project_primary",
+      cwd: fallbackCwd,
+      branchName: null,
+      worktreePath: null,
+      warnings: [
+        `No project workspace is configured for this issue. git_worktree strategy requires a git repository; falling back to temporary workspace "${fallbackCwd}" for this run.`,
+      ],
       created: false,
     };
   }
@@ -1203,6 +1241,18 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   if (strategy !== "git_worktree") {
     return realized;
   }
+
+  // Guard: git_worktree operations require a valid baseCwd with a git repo.
+  // If baseCwd is missing (projectless issue), fall back to project_primary strategy.
+  if (!input.base.baseCwd || input.base.baseCwd.trim().length === 0) {
+    realized.strategy = "project_primary";
+    realized.worktreePath = null;
+    realized.warnings.push(
+      `No project workspace is configured. git_worktree strategy requires a git repository; falling back to project_primary strategy for this run.`,
+    );
+    return realized;
+  }
+
   if (await directoryExists(cwd)) {
     if (provisionCommand) {
       const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);

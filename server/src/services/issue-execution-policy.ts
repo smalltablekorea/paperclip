@@ -308,9 +308,10 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
   }
 
   if (
-    (input.issue.status === "done" || input.issue.status === "cancelled") &&
+    (input.issue.status === "done" || input.issue.status === "closed" || input.issue.status === "cancelled") &&
     requestedStatus &&
     requestedStatus !== "done" &&
+    requestedStatus !== "closed" &&
     requestedStatus !== "cancelled"
   ) {
     patch.executionState = null;

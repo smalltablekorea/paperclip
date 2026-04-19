@@ -94,6 +94,17 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const ACTIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"] as const;
+
+/**
+ * Auto-recovery settings for agents stuck in 'error' status.
+ * After ERROR_AUTO_RECOVERY_MAX_ATTEMPTS consecutive failed heartbeats with
+ * exponential backoff, the agent is automatically reset to 'idle' so the
+ * normal heartbeat schedule can resume.
+ */
+const ERROR_AUTO_RECOVERY_MAX_ATTEMPTS = 3;
+const ERROR_BACKOFF_BASE_SEC = 60;          // 1 min, 2 min, 4 min …
+const ERROR_BACKOFF_MAX_SEC = 15 * 60;      // cap at 15 minutes
+const ERROR_AUTO_RECOVERY_COOLDOWN_MS = 10 * 60 * 1000; // 10 min absolute cooldown
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -1046,7 +1057,6 @@ function shouldAutoCheckoutIssueForWake(input: {
   if (
     issueStatus !== "todo" &&
     issueStatus !== "backlog" &&
-    issueStatus !== "blocked" &&
     issueStatus !== "in_progress"
   ) {
     return false;
@@ -2698,12 +2708,54 @@ export function heartbeatService(db: Db) {
     const isFirstHeartbeat = !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
-    const nextStatus =
+    const isError = outcome !== "succeeded" && outcome !== "cancelled" && runningCount === 0;
+    let nextStatus: string =
       runningCount > 0
         ? "running"
-        : outcome === "succeeded" || outcome === "cancelled"
-          ? "idle"
-          : "error";
+        : isError
+          ? "error"
+          : "idle";
+
+    // ── Auto-recovery tracking for error agents (#4021) ──
+    // Track consecutive error count in agentRuntimeState.stateJson so the
+    // heartbeat scheduler can apply exponential backoff and eventually
+    // auto-recover the agent to 'idle'.
+    const runtime = await ensureRuntimeState(existing);
+    const stateJson = { ...(runtime.stateJson ?? {}) };
+
+    if (isError) {
+      const prevCount = typeof stateJson.consecutiveErrorCount === "number" ? stateJson.consecutiveErrorCount : 0;
+      stateJson.consecutiveErrorCount = prevCount + 1;
+      stateJson.firstErrorAt = stateJson.firstErrorAt ?? new Date().toISOString();
+      stateJson.lastErrorAt = new Date().toISOString();
+
+      // After ERROR_AUTO_RECOVERY_MAX_ATTEMPTS consecutive errors, check
+      // if enough cooldown time has passed and auto-recover to 'idle'.
+      if ((stateJson.consecutiveErrorCount as number) > ERROR_AUTO_RECOVERY_MAX_ATTEMPTS) {
+        const firstErrorTime = new Date(stateJson.firstErrorAt as string).getTime();
+        const elapsed = Date.now() - firstErrorTime;
+        if (elapsed >= ERROR_AUTO_RECOVERY_COOLDOWN_MS) {
+          nextStatus = "idle";
+          stateJson.consecutiveErrorCount = 0;
+          delete stateJson.firstErrorAt;
+          delete stateJson.lastErrorAt;
+          logger.info(
+            { agentId, elapsed, attempts: prevCount + 1 },
+            "auto-recovering agent from error status to idle after cooldown",
+          );
+        }
+      }
+    } else {
+      // Successful or cancelled run — clear error tracking state
+      stateJson.consecutiveErrorCount = 0;
+      delete stateJson.firstErrorAt;
+      delete stateJson.lastErrorAt;
+    }
+
+    await db
+      .update(agentRuntimeState)
+      .set({ stateJson, updatedAt: new Date() })
+      .where(eq(agentRuntimeState.agentId, agentId));
 
     const updated = await db
       .update(agents)
@@ -3122,6 +3174,162 @@ export function heartbeatService(db: Db) {
     return result;
   }
 
+  /**
+   * Sweep issues where the last comment was posted by an agent and no human
+   * has replied within the configured timeout.  For each timed-out issue the
+   * function either:
+   *  1. Re-wakes the assigned agent with a synthetic "question_timeout" reason
+   *     so the agent can proceed with a sensible default, OR
+   *  2. If the agent has no live execution path, marks the issue as "blocked"
+   *     and posts a system comment so it is visible for human intervention.
+   *
+   * The timeout is read from InstanceExperimentalSettings.agentQuestionTimeoutMinutes
+   * (default 30, 0 = disabled).
+   */
+  async function sweepTimedOutAgentQuestions(timeoutMinutes: number) {
+    if (timeoutMinutes <= 0) return { timedOut: 0, requeued: 0, escalated: 0, skipped: 0, issueIds: [] as string[] };
+
+    const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000);
+
+    // Find open issues assigned to agents where the most recent comment was
+    // authored by an agent and was created before the cutoff.
+    //
+    // We look for issues whose latest comment is agent-authored (authorAgentId IS NOT NULL,
+    // authorUserId IS NULL) and older than the cutoff, meaning no human has
+    // replied since the agent's question.
+    const candidates = await db.execute<{
+      issue_id: string;
+      company_id: string;
+      assignee_agent_id: string;
+      status: string;
+      identifier: string | null;
+      last_comment_id: string;
+      last_comment_body: string;
+      last_comment_created_at: Date;
+      last_comment_agent_id: string;
+    }>(sql`
+      with latest_comments as (
+        select distinct on (ic.issue_id)
+          ic.issue_id,
+          ic.id as comment_id,
+          ic.body as comment_body,
+          ic.created_at as comment_created_at,
+          ic.author_agent_id,
+          ic.author_user_id
+        from issue_comments ic
+        order by ic.issue_id, ic.created_at desc, ic.id desc
+      )
+      select
+        i.id as issue_id,
+        i.company_id,
+        i.assignee_agent_id,
+        i.status,
+        i.identifier,
+        lc.comment_id as last_comment_id,
+        lc.comment_body as last_comment_body,
+        lc.comment_created_at as last_comment_created_at,
+        lc.author_agent_id as last_comment_agent_id
+      from issues i
+      inner join latest_comments lc on lc.issue_id = i.id
+      where i.assignee_agent_id is not null
+        and i.status in ('todo', 'in_progress', 'in_review')
+        and lc.author_agent_id is not null
+        and lc.author_user_id is null
+        and lc.comment_created_at < ${cutoff}
+    `);
+
+    const result = { timedOut: 0, requeued: 0, escalated: 0, skipped: 0, issueIds: [] as string[] };
+
+    for (const row of candidates.rows) {
+      result.timedOut += 1;
+      const agentId = row.assignee_agent_id;
+      const issueId = row.issue_id;
+
+      const agent = await getAgent(agentId);
+      if (!agent || agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Check if there's already an active execution path (running/queued run or deferred wake).
+      if (await hasActiveExecutionPath(row.company_id, issueId)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Try to re-wake the agent so it can auto-proceed with a default answer.
+      const queued = await enqueueWakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "agent_question_timeout",
+        payload: {
+          issueId,
+          timedOutCommentId: row.last_comment_id,
+          timeoutMinutes,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: "question_timeout_sweep",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "agent_question_timeout",
+          timedOutCommentId: row.last_comment_id,
+          source: "heartbeat.question_timeout_sweep",
+        },
+      });
+
+      if (queued) {
+        // Post a system comment noting the timeout so the agent and humans have context.
+        await issuesSvc.addComment(
+          issueId,
+          `⏱ **Agent question timeout** — The agent's last comment received no human reply within ${timeoutMinutes} minutes. ` +
+            `Automatically re-waking the agent to proceed with a default or mark the issue for attention.`,
+          {},
+        );
+        result.requeued += 1;
+        result.issueIds.push(issueId);
+        continue;
+      }
+
+      // If we couldn't enqueue a wake (e.g. concurrency limits), escalate to blocked.
+      if (row.status !== "blocked") {
+        const updated = await issuesSvc.update(issueId, { status: "blocked" });
+        if (updated) {
+          await issuesSvc.addComment(
+            issueId,
+            `⏱ **Needs attention** — The agent asked a question ${timeoutMinutes} minutes ago and received no ` +
+              `reply. The agent could not be automatically re-woken. Moving to \`blocked\` for human intervention.`,
+            {},
+          );
+          await logActivity(db, {
+            companyId: row.company_id,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: issueId,
+            details: {
+              identifier: row.identifier,
+              status: "blocked",
+              previousStatus: row.status,
+              source: "heartbeat.question_timeout_sweep",
+              timedOutCommentId: row.last_comment_id,
+            },
+          });
+          result.escalated += 1;
+          result.issueIds.push(issueId);
+          continue;
+        }
+      }
+
+      result.skipped += 1;
+    }
+
+    return result;
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -3263,7 +3471,7 @@ export function heartbeatService(db: Db) {
       })
     ) {
       try {
-        await issuesSvc.checkout(issueId, agent.id, ["todo", "backlog", "blocked"], run.id);
+        await issuesSvc.checkout(issueId, agent.id, ["todo", "backlog"], run.id);
         context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
       } catch (error) {
         if (!isCheckoutConflictError(error)) throw error;
@@ -4297,8 +4505,14 @@ export function heartbeatService(db: Db) {
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
+        // Only reopen for deferred comment wakes that originated from a
+        // non-agent actor.  Agent-authored comments must never implicitly
+        // reopen their own tasks — doing so causes an infinite
+        // Done → In Progress loop (#3935).
         const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 && (issue.status === "done" || issue.status === "cancelled");
+          deferredCommentIds.length > 0 &&
+          (issue.status === "done" || issue.status === "closed" || issue.status === "cancelled") &&
+          deferred.requestedByActorType !== "agent";
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {
@@ -5325,11 +5539,14 @@ export function heartbeatService(db: Db) {
 
     reconcileStrandedAssignedIssues,
 
+    sweepTimedOutAgentQuestions,
+
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let recovered = 0;
 
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
@@ -5338,8 +5555,68 @@ export function heartbeatService(db: Db) {
 
         checked += 1;
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+        let effectiveIntervalMs = policy.intervalSec * 1000;
+
+        // ── Exponential backoff for error agents (#4021) ──
+        // When an agent is in 'error' status, apply exponential backoff to
+        // the heartbeat interval so we don't hammer a broken agent but still
+        // give it periodic chances to recover.
+        if (agent.status === "error") {
+          const runtimeRow = await db
+            .select({ stateJson: agentRuntimeState.stateJson })
+            .from(agentRuntimeState)
+            .where(eq(agentRuntimeState.agentId, agent.id))
+            .then((rows) => rows[0] ?? null);
+          const errorCount = typeof runtimeRow?.stateJson?.consecutiveErrorCount === "number"
+            ? runtimeRow.stateJson.consecutiveErrorCount
+            : 0;
+          if (errorCount > 0) {
+            const backoffSec = Math.min(
+              ERROR_BACKOFF_BASE_SEC * Math.pow(2, errorCount - 1),
+              ERROR_BACKOFF_MAX_SEC,
+            );
+            effectiveIntervalMs = Math.max(effectiveIntervalMs, backoffSec * 1000);
+          }
+
+          // If we've exceeded the cooldown window without a run attempt,
+          // auto-recover the agent to 'idle' so normal scheduling resumes.
+          const firstErrorAt = runtimeRow?.stateJson?.firstErrorAt;
+          if (
+            typeof firstErrorAt === "string" &&
+            errorCount > ERROR_AUTO_RECOVERY_MAX_ATTEMPTS
+          ) {
+            const elapsed = now.getTime() - new Date(firstErrorAt).getTime();
+            if (elapsed >= ERROR_AUTO_RECOVERY_COOLDOWN_MS) {
+              await db
+                .update(agents)
+                .set({ status: "idle", updatedAt: new Date() })
+                .where(eq(agents.id, agent.id));
+              const clearState = { ...(runtimeRow?.stateJson ?? {}) };
+              clearState.consecutiveErrorCount = 0;
+              delete clearState.firstErrorAt;
+              delete clearState.lastErrorAt;
+              await db
+                .update(agentRuntimeState)
+                .set({ stateJson: clearState, updatedAt: new Date() })
+                .where(eq(agentRuntimeState.agentId, agent.id));
+              publishLiveEvent({
+                companyId: agent.companyId,
+                type: "agent.status",
+                payload: { agentId: agent.id, status: "idle" },
+              });
+              logger.info(
+                { agentId: agent.id, errorCount, elapsed },
+                "tickTimers auto-recovered error agent to idle",
+              );
+              recovered += 1;
+              // Let the next tick pick up this now-idle agent normally
+              continue;
+            }
+          }
+        }
+
         const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
+        if (elapsedMs < effectiveIntervalMs) continue;
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -5349,7 +5626,7 @@ export function heartbeatService(db: Db) {
           requestedByActorId: "heartbeat_scheduler",
           contextSnapshot: {
             source: "scheduler",
-            reason: "interval_elapsed",
+            reason: agent.status === "error" ? "error_recovery_attempt" : "interval_elapsed",
             now: now.toISOString(),
           },
         });
@@ -5357,7 +5634,7 @@ export function heartbeatService(db: Db) {
         else skipped += 1;
       }
 
-      return { checked, enqueued, skipped };
+      return { checked, enqueued, skipped, recovered };
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),

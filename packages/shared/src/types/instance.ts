@@ -26,6 +26,8 @@ export interface InstanceGeneralSettings {
 export interface InstanceExperimentalSettings {
   enableIsolatedWorkspaces: boolean;
   autoRestartDevServerWhenIdle: boolean;
+  /** Minutes to wait for a human reply after an agent posts a question before auto-escalating. 0 = disabled. */
+  agentQuestionTimeoutMinutes: number;
 }
 
 export interface InstanceSettings {

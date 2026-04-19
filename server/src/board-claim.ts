@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { companies, companyMemberships, instanceUserRoles, issues } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 
 const LOCAL_BOARD_USER_ID = "local-board";
@@ -138,6 +138,12 @@ export async function claimBoardOwnership(
           .where(eq(companyMemberships.id, existing.id));
       }
     }
+
+    // Migrate orphan assigneeUserId='local-board' on existing issues (#3974)
+    await tx
+      .update(issues)
+      .set({ assigneeUserId: opts.userId, updatedAt: new Date() })
+      .where(eq(issues.assigneeUserId, LOCAL_BOARD_USER_ID));
   });
 
   if (activeChallenge && activeChallenge.token === opts.token) {

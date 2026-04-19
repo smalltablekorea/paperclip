@@ -36,7 +36,7 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 
-const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "closed", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 
 function assertTransition(from: string, to: string) {
@@ -55,7 +55,7 @@ function applyStatusSideEffects(
   if (status === "in_progress" && !patch.startedAt) {
     patch.startedAt = new Date();
   }
-  if (status === "done") {
+  if (status === "done" || status === "closed") {
     patch.completedAt = new Date();
   }
   if (status === "cancelled") {
@@ -1373,7 +1373,7 @@ export function issueService(db: Db) {
       }
 
       return candidates
-        .filter((candidate) => candidate.assigneeAgentId && !["backlog", "done", "cancelled"].includes(candidate.status))
+        .filter((candidate) => candidate.assigneeAgentId && !["backlog", "done", "closed", "cancelled"].includes(candidate.status))
         .map((candidate) => {
           const blockers = blockersByIssueId.get(candidate.id) ?? [];
           return {
@@ -1401,7 +1401,7 @@ export function issueService(db: Db) {
         .from(issues)
         .where(eq(issues.id, parentIssueId))
         .then((rows) => rows[0] ?? null);
-      if (!parent || !parent.assigneeAgentId || ["backlog", "done", "cancelled"].includes(parent.status)) {
+      if (!parent || !parent.assigneeAgentId || ["backlog", "done", "closed", "cancelled"].includes(parent.status)) {
         return null;
       }
 
@@ -1410,7 +1410,7 @@ export function issueService(db: Db) {
         .from(issues)
         .where(and(eq(issues.companyId, parent.companyId), eq(issues.parentId, parentIssueId)));
       if (children.length === 0) return null;
-      if (!children.every((child) => child.status === "done" || child.status === "cancelled")) {
+      if (!children.every((child) => child.status === "done" || child.status === "closed" || child.status === "cancelled")) {
         return null;
       }
 
@@ -1450,6 +1450,17 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       return db.transaction(async (tx) => {
+        // Inherit projectId from parent issue when not explicitly provided
+        if (issueData.parentId && !issueData.projectId) {
+          const parentIssue = await tx
+            .select({ projectId: issues.projectId })
+            .from(issues)
+            .where(and(eq(issues.id, issueData.parentId), eq(issues.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (parentIssue?.projectId) {
+            issueData.projectId = parentIssue.projectId;
+          }
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
@@ -1572,7 +1583,7 @@ export function issueService(db: Db) {
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
-        if (values.status === "done") {
+        if (values.status === "done" || values.status === "closed") {
           values.completedAt = new Date();
         }
         if (values.status === "cancelled") {
@@ -1670,7 +1681,7 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
-      if (issueData.status && issueData.status !== "done") {
+      if (issueData.status && issueData.status !== "done" && issueData.status !== "closed") {
         patch.completedAt = null;
       }
       if (issueData.status && issueData.status !== "cancelled") {
@@ -2026,6 +2037,9 @@ export function issueService(db: Db) {
           status: "todo",
           assigneeAgentId: null,
           checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
           updatedAt: new Date(),
         })
         .where(eq(issues.id, id))

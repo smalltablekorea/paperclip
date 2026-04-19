@@ -58,7 +58,7 @@ export function dashboardService(db: Db) {
         if (row.status === "in_progress") taskCounts.inProgress += count;
         if (row.status === "blocked") taskCounts.blocked += count;
         if (row.status === "done") taskCounts.done += count;
-        if (row.status !== "done" && row.status !== "cancelled") taskCounts.open += count;
+        if (row.status !== "done" && row.status !== "closed" && row.status !== "cancelled") taskCounts.open += count;
       }
 
       const now = new Date();

@@ -7,7 +7,10 @@ type MarkdownNode = {
 
 const BARE_ISSUE_IDENTIFIER_RE = /^[A-Z][A-Z0-9]+-\d+$/i;
 const ISSUE_SCHEME_RE = /^issue:\/\/:?([^?#\s]+)(?:[?#].*)?$/i;
-const ISSUE_REFERENCE_TOKEN_RE = /issue:\/\/:?[^\s<>()]+|https?:\/\/[^\s<>()]+|\b[A-Z][A-Z0-9]+-\d+\b/gi;
+// Bare issue-identifier alternative uses negative lookbehind/lookahead to
+// reject matches inside template placeholders like {PROJ-1}, <PROJ-1>,
+// and identifiers glued to surrounding word characters.
+const ISSUE_REFERENCE_TOKEN_RE = /issue:\/\/:?[^\s<>()]+|https?:\/\/[^\s<>()]+|(?<![{<\w])(?:[A-Z][A-Z0-9]+-\d+)(?![}\w>-])/gi;
 
 export function parseIssuePathIdFromPath(pathOrUrl: string | null | undefined): string | null {
   if (!pathOrUrl) return null;

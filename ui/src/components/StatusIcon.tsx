@@ -4,7 +4,7 @@ import { issueStatusIcon, issueStatusIconDefault } from "../lib/status-colors";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
 
-const allStatuses = ["backlog", "todo", "in_progress", "in_review", "done", "cancelled", "blocked"];
+const allStatuses = ["backlog", "todo", "in_progress", "in_review", "done", "closed", "cancelled", "blocked"];
 
 function statusLabel(status: string): string {
   return status.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -20,7 +20,7 @@ interface StatusIconProps {
 export function StatusIcon({ status, onChange, className, showLabel }: StatusIconProps) {
   const [open, setOpen] = useState(false);
   const colorClass = issueStatusIcon[status] ?? issueStatusIconDefault;
-  const isDone = status === "done";
+  const isDone = status === "done" || status === "closed";
 
   const circle = (
     <span

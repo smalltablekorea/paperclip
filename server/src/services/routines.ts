@@ -45,7 +45,7 @@ import { logActivity } from "./activity-log.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"];
-const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "closed", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const WEEKDAY_INDEX: Record<string, number> = {
   Sun: 0,
@@ -1533,7 +1533,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue || issue.originKind !== "routine_execution" || !issue.originRunId) return null;
-      if (issue.status === "done") {
+      if (issue.status === "done" || issue.status === "closed") {
         return finalizeRun(issue.originRunId, {
           status: "completed",
           completedAt: new Date(),

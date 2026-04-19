@@ -602,7 +602,7 @@ export async function startServer(): Promise<StartedServer> {
       void heartbeat
         .tickTimers(new Date())
         .then((result) => {
-          if (result.enqueued > 0) {
+          if (result.enqueued > 0 || result.recovered > 0) {
             logger.info({ ...result }, "heartbeat timer tick enqueued runs");
           }
         })
@@ -634,6 +634,21 @@ export async function startServer(): Promise<StartedServer> {
             reconciled.escalated > 0
           ) {
             logger.warn({ ...reconciled }, "periodic stranded-issue reconciliation changed assigned issue state");
+          }
+
+          // Sweep agent questions that timed out waiting for human reply (#4022)
+          try {
+            const settingsSvc = instanceSettingsService(db);
+            const expSettings = await settingsSvc.getExperimental();
+            const timeoutMinutes = (expSettings as any).agentQuestionTimeoutMinutes ?? 30;
+            if (timeoutMinutes > 0) {
+              const swept = await heartbeat.sweepTimedOutAgentQuestions(timeoutMinutes);
+              if (swept.requeued > 0 || swept.escalated > 0) {
+                logger.warn({ ...swept }, "agent question timeout sweep changed issue state");
+              }
+            }
+          } catch (sweepErr) {
+            logger.error({ err: sweepErr }, "agent question timeout sweep failed");
           }
         })
         .catch((err) => {

@@ -29,6 +29,7 @@ const boardStatuses = [
   "in_review",
   "blocked",
   "done",
+  "closed",
   "cancelled",
 ];
 

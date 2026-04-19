@@ -35,6 +35,7 @@ export const patchInstanceGeneralSettingsSchema = instanceGeneralSettingsSchema.
 export const instanceExperimentalSettingsSchema = z.object({
   enableIsolatedWorkspaces: z.boolean().default(false),
   autoRestartDevServerWhenIdle: z.boolean().default(false),
+  agentQuestionTimeoutMinutes: z.number().int().min(0).default(30),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

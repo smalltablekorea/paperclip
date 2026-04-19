@@ -636,9 +636,11 @@ async function resolveSpawnTarget(
     // ComSpec to PowerShell, which breaks cmd-specific flags like /d /s /c.
     const shell = resolveWindowsCmdShell(env);
     const commandLine = [quoteForCmd(executable), ...args.map(quoteForCmd)].join(" ");
+    // Set console code page to UTF-8 (65001) before running the command
+    // to prevent CJK character garbling from GBK/CP936 default. (#3940)
     return {
       command: shell,
-      args: ["/d", "/s", "/c", commandLine],
+      args: ["/d", "/s", "/c", `chcp 65001 >nul & ${commandLine}`],
     };
   }
 
@@ -1095,6 +1097,19 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
+    // Force UTF-8 encoding for child processes to prevent CJK character
+    // garbling on Windows where the default codepage is often GBK/CP936.
+    // These env vars ensure Python, Node, and other runtimes use UTF-8
+    // for stdin/stdout/stderr regardless of the system locale. (#3940)
+    if (!rawMerged.PYTHONIOENCODING) rawMerged.PYTHONIOENCODING = "utf-8";
+    if (!rawMerged.PYTHONUTF8) rawMerged.PYTHONUTF8 = "1";
+    if (!rawMerged.LANG) rawMerged.LANG = "en_US.UTF-8";
+    if (!rawMerged.LC_ALL) rawMerged.LC_ALL = "en_US.UTF-8";
+    // Node.js child processes: force UTF-8 encoding for stdout/stderr
+    if (!rawMerged.NODE_OPTIONS?.includes("--input-type")) {
+      rawMerged.CHCP = "65001";
+    }
+
     const mergedEnv = ensurePathInEnv(rawMerged);
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv)
       .then((target) => {
@@ -1105,6 +1120,10 @@ export async function runChildProcess(
           shell: false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
+        // Ensure stdout/stderr are decoded as UTF-8, not the OS default
+        // codepage (e.g. GBK on Chinese Windows). (#3940)
+        child.stdout?.setEncoding("utf8");
+        child.stderr?.setEncoding("utf8");
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 

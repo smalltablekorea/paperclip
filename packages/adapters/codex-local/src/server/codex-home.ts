@@ -42,11 +42,28 @@ async function ensureParentDir(target: string): Promise<void> {
   await fs.mkdir(path.dirname(target), { recursive: true });
 }
 
+async function symlinkOrCopy(source: string, target: string): Promise<void> {
+  try {
+    await fs.symlink(source, target);
+  } catch (err: unknown) {
+    // On Windows, creating symlinks requires elevated privileges and fails
+    // with EPERM for normal users. Fall back to a regular file copy (#3997).
+    if (
+      err instanceof Error &&
+      (err as NodeJS.ErrnoException).code === "EPERM"
+    ) {
+      await fs.copyFile(source, target);
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function ensureSymlink(target: string, source: string): Promise<void> {
   const existing = await fs.lstat(target).catch(() => null);
   if (!existing) {
     await ensureParentDir(target);
-    await fs.symlink(source, target);
+    await symlinkOrCopy(source, target);
     return;
   }
 
@@ -61,7 +78,7 @@ async function ensureSymlink(target: string, source: string): Promise<void> {
   if (resolvedLinkedPath === source) return;
 
   await fs.unlink(target);
-  await fs.symlink(source, target);
+  await symlinkOrCopy(source, target);
 }
 
 async function ensureCopiedFile(target: string, source: string): Promise<void> {

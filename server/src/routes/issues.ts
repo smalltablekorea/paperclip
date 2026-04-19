@@ -158,7 +158,11 @@ function shouldImplicitlyReopenCommentForAgent(input: {
 }) {
   if (!isClosedIssueStatus(input.issueStatus)) return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
-  if (input.actorType === "agent" && input.actorId === input.assigneeAgentId) return false;
+  // Never allow any agent to implicitly reopen via comment — agents must use
+  // explicit `reopen: true` or a status change.  The previous guard only
+  // compared actorId === assigneeAgentId, which broke when actor identity was
+  // misattributed (#3980 / #3935), causing an infinite Done → In Progress loop.
+  if (input.actorType === "agent") return false;
   return true;
 }
 
@@ -585,14 +589,29 @@ export function issueRoutes(
     }
   });
 
-  // Common malformed path when companyId is empty in "/api/companies/{companyId}/issues".
-  router.get("/issues", (_req, res) => {
-    res.status(400).json({
-      error: "Missing companyId in path. Use /api/companies/{companyId}/issues.",
-    });
+  // Flat alias: GET /api/issues – for agents, derive companyId from auth context.
+  // Board users with multiple companies must use the nested route.
+  router.get("/issues", async (req, res) => {
+    let companyId: string | undefined;
+    if (req.actor.type === "agent") {
+      companyId = req.actor.companyId;
+    } else if (req.actor.type === "board") {
+      const companyIds = req.actor.companyIds ?? [];
+      if (companyIds.length === 1) companyId = companyIds[0];
+    }
+    if (!companyId) {
+      res.status(400).json({
+        error: "Missing companyId in path. Use /api/companies/{companyId}/issues.",
+      });
+      return;
+    }
+    (req.params as Record<string, string>).companyId = companyId;
+    return handleListIssues(req, res);
   });
 
-  router.get("/companies/:companyId/issues", async (req, res) => {
+  router.get("/companies/:companyId/issues", handleListIssues);
+
+  async function handleListIssues(req: Request, res: Response) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
@@ -662,7 +681,7 @@ export function issueRoutes(
       limit,
     });
     res.json(result);
-  });
+  }
 
   router.get("/companies/:companyId/labels", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -1326,7 +1345,29 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
-  router.post("/companies/:companyId/issues", validate(createIssueSchema), async (req, res) => {
+  // Flat alias: POST /api/issues – derive companyId from auth context.
+  // Agents always have a single companyId; board users with exactly one company are also supported.
+  router.post("/issues", validate(createIssueSchema), async (req, res) => {
+    let companyId: string | undefined;
+    if (req.actor.type === "agent") {
+      companyId = req.actor.companyId;
+    } else if (req.actor.type === "board") {
+      const companyIds = req.actor.companyIds ?? [];
+      if (companyIds.length === 1) companyId = companyIds[0];
+    }
+    if (!companyId) {
+      res.status(400).json({
+        error: "Missing companyId. Use /api/companies/{companyId}/issues or authenticate as an agent.",
+      });
+      return;
+    }
+    (req.params as Record<string, string>).companyId = companyId;
+    return handleCreateIssue(req, res);
+  });
+
+  router.post("/companies/:companyId/issues", validate(createIssueSchema), handleCreateIssue);
+
+  async function handleCreateIssue(req: Request, res: Response) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
@@ -1370,7 +1411,7 @@ export function issueRoutes(
     });
 
     res.status(201).json(issue);
-  });
+  }
 
   router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
     const id = req.params.id as string;
@@ -2637,7 +2678,23 @@ export function issueRoutes(
     res.json(attachments.map(withContentPath));
   });
 
-  router.post("/companies/:companyId/issues/:issueId/attachments", async (req, res) => {
+  // Flat alias: POST /api/issues/:id/attachments – derive companyId from the issue.
+  router.post("/issues/:id/attachments", async (req, res) => {
+    const issueId = req.params.id as string;
+    const issue = await svc.getById(issueId);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    const params = req.params as Record<string, string>;
+    params.companyId = issue.companyId;
+    params.issueId = issue.id;
+    return handleCreateAttachment(req, res);
+  });
+
+  router.post("/companies/:companyId/issues/:issueId/attachments", handleCreateAttachment);
+
+  async function handleCreateAttachment(req: Request, res: Response) {
     const companyId = req.params.companyId as string;
     const issueId = req.params.issueId as string;
     assertCompanyAccess(req, companyId);
@@ -2722,7 +2779,7 @@ export function issueRoutes(
     });
 
     res.status(201).json(withContentPath(attachment));
-  });
+  }
 
   router.get("/attachments/:attachmentId/content", async (req, res, next) => {
     const attachmentId = req.params.attachmentId as string;

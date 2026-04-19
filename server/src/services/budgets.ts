@@ -735,6 +735,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           status: companies.status,
           pauseReason: companies.pauseReason,
           name: companies.name,
+          budgetMonthlyCents: companies.budgetMonthlyCents,
         })
         .from(companies)
         .where(eq(companies.id, companyId))
@@ -775,6 +776,19 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             reason: "Company cannot start new work because its budget hard-stop is exceeded.",
           };
         }
+      }
+
+      // If no budget policy exists and no budget has been allocated, block invocations
+      // to prevent unrestricted cost accumulation (issue #4027).
+      if (!companyPolicy && company.budgetMonthlyCents === 0) {
+        return {
+          scopeType: "company" as const,
+          scopeId: companyId,
+          scopeName: company.name,
+          reason:
+            "Company has no budget allocated and no active budget policy. " +
+            "Configure a budget or budget policy before starting work.",
+        };
       }
 
       if (agent.status === "paused" && agent.pauseReason === "budget") {
