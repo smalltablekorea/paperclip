@@ -3189,7 +3189,7 @@ export function heartbeatService(db: Db) {
   async function sweepTimedOutAgentQuestions(timeoutMinutes: number) {
     if (timeoutMinutes <= 0) return { timedOut: 0, requeued: 0, escalated: 0, skipped: 0, issueIds: [] as string[] };
 
-    const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000);
+    const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000).toISOString();
 
     // Find open issues assigned to agents where the most recent comment was
     // authored by an agent and was created before the cutoff.
@@ -3240,7 +3240,8 @@ export function heartbeatService(db: Db) {
 
     const result = { timedOut: 0, requeued: 0, escalated: 0, skipped: 0, issueIds: [] as string[] };
 
-    for (const row of candidates.rows) {
+    const candidateRows = Array.isArray(candidates) ? candidates : (candidates.rows ?? []);
+    for (const row of candidateRows) {
       result.timedOut += 1;
       const agentId = row.assignee_agent_id;
       const issueId = row.issue_id;

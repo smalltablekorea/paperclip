@@ -15,6 +15,14 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  financeEvents,
+  projects,
+  routines,
+  routineRuns,
+  approvalComments,
+  approvals,
+  assets,
+  joinRequests,
 } from "@paperclipai/db";
 import { isUuidLike, normalizeAgentUrlKey } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
@@ -482,6 +490,17 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+        // Clear agent references in tables with RESTRICT FK policy
+        await tx.update(projects).set({ leadAgentId: null }).where(eq(projects.leadAgentId, id));
+        await tx.update(routines).set({ assigneeAgentId: null }).where(eq(routines.assigneeAgentId, id));
+        await tx.update(routines).set({ createdByAgentId: null }).where(eq(routines.createdByAgentId, id));
+        await tx.update(routines).set({ updatedByAgentId: null }).where(eq(routines.updatedByAgentId, id));
+        await tx.delete(financeEvents).where(eq(financeEvents.agentId, id));
+        await tx.delete(approvalComments).where(eq(approvalComments.authorAgentId, id));
+        await tx.update(approvals).set({ requestedByAgentId: null }).where(eq(approvals.requestedByAgentId, id));
+        await tx.update(assets).set({ createdByAgentId: null }).where(eq(assets.createdByAgentId, id));
+        await tx.update(joinRequests).set({ createdAgentId: null }).where(eq(joinRequests.createdAgentId, id));
+        await tx.delete(costEvents).where(eq(costEvents.agentId, id));
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
         await tx.delete(activityLog).where(
