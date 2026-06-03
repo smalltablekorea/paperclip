@@ -1,0 +1,22 @@
+{
+  "buildCommand": "pnpm build",
+  "outputDirectory": "dist",
+  "installCommand": "pnpm install",
+  "env": {
+    "DATABASE_URL": "@database_url",
+    "BETTER_AUTH_SECRET": "@better_auth_secret",
+    "CLAUDE_CODE_OAUTH_TOKEN": "@claude_code_oauth_token",
+    "PAPERCLIP_ALLOWED_HOSTNAMES": "@paperclip_allowed_hostnames"
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=3600"
+        }
+      ]
+    }
+  ]
+}
